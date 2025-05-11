@@ -1,0 +1,200 @@
+---
+title: "Projekt scoringi"
+author: "Aleksandra Bukowska,Julia Deptulska"
+date: "2025-05-11"
+output: html_document
+---
+
+Wczytywanie danych i pakietow 
+
+```{r setup, include=FALSE}
+
+library(readxl)
+library(e1071)
+library(openxlsx)
+library(ggplot2)
+library(gridExtra)
+library(googlesheets4)
+dane_projekt <- read_sheet("https://docs.google.com/spreadsheets/d/1ZxsqdQ8NlfZ5etCP9LR1vXNWkIcS6mgcnbc_8L-x-pA/edit?gid=1255751108#gid=1255751108")
+
+```
+
+Sprawdzenie danych i braków
+
+```{r}
+str(dane_projekt)
+sapply(dane_projekt, class)
+
+sum(is.na(dane_projekt))
+
+```
+
+Statystyki opisowe dla  zmiennych ilościowych
+
+```{r}
+ilosciowe <- c("scoring_FICO", "kwota_kredytu", "oproc_konkur", "koszt_pieniadza", "oproc_propon")
+
+oprocentowanie_refin <- dane_projekt[dane_projekt$typ_umowy == "R", ] #tylko dla typu umowy R
+
+# Funkcja do obliczenia statystyk
+calculate_stats <- function(data, x_name) {
+  stats <- c(
+    Mean = mean(data[[x_name]], na.rm = TRUE),
+    Median = median(data[[x_name]], na.rm = TRUE),
+    Max = max(data[[x_name]], na.rm = TRUE),
+    Min = min(data[[x_name]], na.rm = TRUE),
+    SD = sd(data[[x_name]], na.rm = TRUE),
+    Range = diff(range(data[[x_name]], na.rm = TRUE)),
+    Skewness = skewness(data[[x_name]], na.rm = TRUE),
+    Kurtosis = kurtosis(data[[x_name]], na.rm = TRUE)
+  )
+  return(stats)
+}
+
+
+stats_table <- sapply(ilosciowe, function(x) calculate_stats(dane_projekt, x))
+stats_table_refin <- sapply("oproc_refin", function(x) calculate_stats(oprocentowanie_refin, x))
+
+final_stats <- cbind(stats_table, stats_table_refin)
+final_stats <- t(final_stats)
+
+options(scipen = 999)
+print(final_stats)
+```
+
+Histogramy
+```{r}
+par(mfrow = c(3, 3))
+
+for (x in ilosciowe) {
+  hist(dane_projekt[[x]],
+       main = paste("Histogram:", x),
+       xlab = "",   
+       col = "lightgreen")
+}
+
+hist(oprocentowanie_refin$oproc_refin,
+     main = "Histogram: oproc_refin",
+     xlab = "",
+     col = "lightgreen")
+```
+
+
+
+Tabele liczebności dla kategorycznych
+
+```{r}
+
+kategotyczne <- c("grupa_ryzyka", "kod_partnera", "okres_kredytu", "typ_umowy", "akceptacja_klienta")
+
+for (x in kategotyczne) {
+
+  cat_table <- table(dane_projekt[[x]], useNA = "ifany")
+  cat_prop <- prop.table(cat_table)  # Częstości (proporcje)
+  cat_df <- data.frame(
+    Category = names(cat_table),
+    Count = as.vector(cat_table),
+    Proportion = as.vector(cat_prop)
+  )
+  cat("Tabela dla zmiennej:", x, "\n")
+  print(cat_df)
+  cat("\n")
+}
+```
+
+Dodawanie nowych zmiennych pochodnych
+
+```{r}
+dane_projekt$oprocentowanie_rozbieznosc <- dane_projekt$oproc_propon - dane_projekt$oproc_konkur
+
+dane_projekt$koszt_vs_refinansowanie <- dane_projekt$koszt_pieniadza - dane_projekt$oproc_refin
+
+dane_projekt$długość_umowy_lat <- dane_projekt$okres_kredytu / 12
+
+dane_projekt$relatywny_scoring <- dane_projekt$scoring_FICO / 850
+
+dane_projekt$procent_marzy <- (dane_projekt$oproc_propon - dane_projekt$koszt_pieniadza) / dane_projekt$koszt_pieniadza
+
+
+```
+Wykresy niektorych zmiennych pochodnych
+
+wykres koszt_vs_refinansowanie
+
+```{r}
+library(ggplot2)
+
+ggplot(dane_projekt, aes(x = koszt_vs_refinansowanie)) +
+  geom_histogram(binwidth = 0.02, fill = "#f4a582", color = "black") +
+  labs(
+    title = "Histogram zmiennej: koszt_vs_refinansowanie",
+    x = "Koszt pieniądza - Oprocentowanie refinansowania",
+    y = "Liczba obserwacji"
+  ) +
+  theme_minimal()
+
+
+
+```
+
+#Wykres oprocentowanie_rozbieznosc
+```{r}
+library(ggplot2)
+
+ggplot(dane_projekt, aes(x = oprocentowanie_rozbieznosc)) +
+  geom_histogram(binwidth = 0.002, fill = "#69b3a2", color = "black") +
+  labs(
+    title = "Histogram zmiennej: oprocentowanie_rozbieznosc",
+    x = "Oprocentowanie proponowane - Oprocentowanie konkurencji",
+    y = "Liczba obserwacji"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+library(scorecard)
+library(vcd)
+library(dplyr)
+library(DescTools)
+```
+
+ Obliczanie Information Value (IV)
+```{r}
+# Tymczasowe dane bez LP i data_akceptacji
+dane_do_iv <- dane_projekt %>% select(-LP, -data_akceptacji)
+# Oblicz IV – pomijając unikalne ID i datę
+iv_wyniki <- iv(dane_do_iv, "akceptacja_klienta") %>%
+  arrange(desc(info_value)) %>%
+  mutate(
+    siła_predykcyjna = case_when(
+      info_value < 0.02 ~ "Brak / bardzo słaba",
+      info_value < 0.1 ~ "Słaba",
+      info_value < 0.3 ~ "Umiarkowana",
+      info_value < 0.5 ~ "Silna",
+      TRUE ~ "Bardzo silna "
+    )
+  )
+# Wyświetlenie wyników
+print(iv_wyniki)
+
+```
+
+# Wykres z IV
+```{r}
+library(ggplot2)
+
+ggplot(iv_wyniki, aes(x = reorder(variable, info_value), y = info_value, fill = siła_predykcyjna)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Siła predykcyjna zmiennych (Information Value)",
+    x = "Zmienna",
+    y = "Wartość IV"
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  theme_minimal()
+
+```
+
+
