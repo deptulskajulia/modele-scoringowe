@@ -1,0 +1,395 @@
+---
+title: "Projekt scoringi"
+author: "Aleksandra Bukowska,Julia Deptulska"
+date: "2025-04-24"
+output: html_document
+---
+
+Wczytywanie danych i pakietow 
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(readxl)
+library(e1071)
+library(openxlsx)
+library(ggplot2)
+library(gridExtra)
+library(googlesheets4)
+dane_projekt <- read_sheet("https://docs.google.com/spreadsheets/d/1ZxsqdQ8NlfZ5etCP9LR1vXNWkIcS6mgcnbc_8L-x-pA/edit?gid=1255751108#gid=1255751108")
+
+```
+
+Sprawdzenie rodzaju danych
+
+```{r}
+str(dane_projekt)
+sapply(dane_projekt, class)
+
+```
+
+Dodawanie nowych zmiennych pochodnych
+
+```{r}
+dane_projekt$oprocentowanie_rozbieznosc <- dane_projekt$oproc_propon - dane_projekt$oproc_konkur
+
+dane_projekt$koszt_vs_refinansowanie <- dane_projekt$koszt_pieniadza - dane_projekt$oproc_refin
+
+dane_projekt$długość_umowy_lat <- dane_projekt$okres_kredytu / 12
+
+dane_projekt$relatywny_scoring <- dane_projekt$scoring_FICO / 850
+
+dane_projekt$procent_marzy <- (dane_projekt$oproc_propon - dane_projekt$koszt_pieniadza) / dane_projekt$koszt_pieniadza
+
+
+```
+
+Wykresy niektorych zmiennych pochodnych
+
+wykres koszt_vs_refinansowanie
+
+```{r}
+library(ggplot2)
+
+ggplot(dane_projekt, aes(x = koszt_vs_refinansowanie)) +
+  geom_histogram(binwidth = 0.009, fill = "#f4a582", color = "black") +
+  labs(
+    title = "Histogram zmiennej: koszt_vs_refinansowanie",
+    x = "Koszt pieniądza - Oprocentowanie refinansowania",
+    y = "Liczba obserwacji"
+  ) +
+  theme_minimal()
+
+
+
+```
+
+#Wykres oprocentowanie_rozbieznosc
+```{r}
+library(ggplot2)
+
+ggplot(dane_projekt, aes(x = oprocentowanie_rozbieznosc)) +
+  geom_histogram(binwidth = 0.002, fill = "#69b3a2", color = "black") +
+  labs(
+    title = "Histogram zmiennej: oprocentowanie_rozbieznosc",
+    x = "Oprocentowanie proponowane - Oprocentowanie konkurencji",
+    y = "Liczba obserwacji"
+  ) +
+  theme_minimal()
+
+```
+
+
+Wczytywanie dodatkowych pakietów
+```{r}
+library(scorecard)
+library(vcd)
+library(dplyr)
+library(DescTools)
+```
+Dodajemy zmienną bad, mówiącą nam o tym czy klient odrzucił (1) ofertę kredytową czy zaakceptował (0), przyda się to w późniejszej części modelu.
+```{r}
+dane_projekt$bad<- 1-dane_projekt$akceptacja_klienta
+```
+
+Wybieramy dane do liczenia IV.
+```{r}
+dane_do_iv <- dane_projekt %>% select(-LP, -data_akceptacji, -akceptacja_klienta)
+```
+
+Binujemy(kubełkujemy) zmienne żeby móc wyliczyć IV
+```{r}
+biny <- woebin(dane_do_iv, "bad", method = "tree")
+dane_zbinowane <-woebin_ply(dane_do_iv, biny)
+
+# Wyznaczenie IV
+iv_table <- iv(dane_zbinowane, y = "bad")
+```
+
+Obliczanie Information Value (IV)
+```{r}
+
+#Tabela IV 
+iv_table <- iv_table %>%
+  select(variable, info_value)
+
+liczba_binów <- dane_zbinowane %>%
+  select(-bad) %>%
+  summarise(across(everything(), n_distinct)) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "liczba_binów")
+
+iv_table <- left_join(iv_table, liczba_binów, by = "variable")
+
+#Wykres zbinowanych zmiennych z liczbą binów i wartością IV
+wykres <- ggplot(iv_table, aes(x = reorder(variable, -info_value), y = info_value, fill = as.factor(liczba_binów))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Wartości IV dla zmiennych i liczba wyznaczonych bins",
+       x = "Zmienna",
+       y = "Information Value (IV)",
+       fill = "Liczba binów") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(wykres)
+```
+
+
+
+
+```{r}
+#Filtrowanie zmiennych z IV > 0.1
+wybrane_zmienne <- subset(iv_table, info_value > 0.1)
+
+#Pobranie nazw zmiennych spełniających kryteria
+wybrane_zmienne <- as.character(wybrane_zmienne$variable)
+
+#Weryfikacja: tylko zmienne, które faktycznie istnieją w danych
+wybrane_zmienne <- wybrane_zmienne[wybrane_zmienne %in% colnames(dane_zbinowane)]
+
+#Dołączenie zmiennej celu (bad) do zbioru danych
+zmienne_do_modelu <- c("bad", wybrane_zmienne)
+
+#Wybór kolumn (ze wzg na składnię data.table — używamy ..)
+
+zmienne_zbinowane_do_modelu <- dane_zbinowane[, ..zmienne_do_modelu]
+
+#Konwersja do data.frame, aby glm lepiej działał
+zmienne_zbinowane_do_modelu_df <- as.data.frame(zmienne_zbinowane_do_modelu)
+```
+
+Tworzenie modelu liniowego.
+
+```{r}
+model_regresji_lin <- glm(bad ~ ., data = zmienne_zbinowane_do_modelu_df, family = "binomial")
+summary(model_regresji_lin)
+
+# Wyznaczenie punktacji
+scorecard <- scorecard(biny, model_regresji_lin)
+
+
+#Utworzeniezbioru danych na którym tworzymy scoring
+
+zmienne_do_modelu_bez_woe <- gsub("_woe$", "", zmienne_do_modelu[zmienne_do_modelu != "bad"])
+
+#Przesunięcie zmiennej celu na początek
+zmienne_do_modelu_bez_woe <- c("bad", zmienne_do_modelu_bez_woe)
+
+#Wybór zmiennych z niezbinowanego zbioru
+dane_do_modelu_niezbinowane <- dane_do_iv[, zmienne_do_modelu_bez_woe]
+
+#Liczymy AUC i Gini
+auc <- bigstatsr::AUC(-scorecard_ply(zmienne_niezbinowane, scorecard)$score, zmienne_niezbinowane$bad)
+gini <- 2 * auc - 1
+
+```
+
+```{r}
+#Obliczamy wartość score dla każdego rekordu w danych
+wartość_score <- scorecard_ply(dane_do_modelu_niezbinowane, scorecard)
+
+#Dołączenie kolumny ze scoringiem
+dane_do_modelu_niezbinowane_ze_scoringiem <- cbind(dane_do_modelu_niezbinowane, wartość_score)
+head(dane_do_modelu_niezbinowane_ze_scoringiem)
+
+#podsumowanie wartości score w naszych danych
+summary(dane_do_modelu_niezbinowane_ze_scoringiem$score)
+
+```
+Gnenerowanie karty scoringowej - do worda
+```{r}
+karta_scoringowa <- rbindlist(scorecard,fill=TRUE)
+
+#Wybieramy interesujace nas kolumny i sortujemy
+karta_scoringowa <- karta_scoringowa[, .(variable, bin, points, count)]
+setorder(karta_scoringowa, variable, bin)
+
+ft <- flextable(karta_scoringowa) %>%
+  merge_v(j = "variable") %>%     # <- SCALANIE komórek w kolumnie 'variable'
+  valign(j = "variable", valign = "top") %>%  # estetyka
+  autofit()
+
+doc <- read_docx()
+doc <- body_add_par(doc, "Scorecard Table", style = "heading 1")
+doc <- body_add_flextable(doc, ft)
+print(doc, target = "scorecard_merged.docx")
+
+```
+
+Tworzymy przedziały.
+```{r}
+
+breaks_seq <- seq(floor(min(dane_do_modelu_niezbinowane_ze_scoringiem$score)), ceiling(max(dane_do_modelu_niezbinowane_ze_scoringiem$score)+2), by = 50)
+
+dane_do_modelu_niezbinowane_ze_scoringiem %>%
+  mutate(score_bin = cut(score, breaks = breaks_seq, right = FALSE)) %>%
+  group_by(score_bin) %>%
+  summarize(
+    bad_rate = mean(bad),
+    total = n(),
+    liczba_bad = sum(bad)
+  ) -> badrates_bins
+
+print(badrates_bins)
+
+
+```
+
+Wykres bad rate w zależności od przedziałów score
+```{r}
+ggplot(badrates_bins, aes(x = score_bin, y = bad_rate, group = 1)) +
+  geom_line(color = "orange", size = 1) +
+  geom_point(color = "red", size = 2) +
+  labs(
+    title = "Bad rate względem przedziałów score",
+    x = "Przedział score",
+    y = "Bad rate"
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.2)
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+```
+
+Wykres krzywej ROC
+```{r}
+#install.packages("pROC")
+library(pROC)
+
+
+roc_obj <- roc(dane_do_modelu_niezbinowane_ze_scoringiem$bad, -dane_do_modelu_niezbinowane_ze_scoringiem$score)
+auc_value <- auc(roc_obj)
+gini_value <- 2*auc_value - 1
+
+
+cat(sprintf("AUC: %.4f\n", auc_value))
+cat(sprintf("Gini: %.4f\n", gini_value))
+
+roc_data <- data.frame(
+  specificity = roc_obj$specificities,
+  sensitivity = roc_obj$sensitivities
+)
+
+
+ggplot(roc_data, aes(x = 1 - specificity, y = sensitivity)) +
+  geom_line(color = "pink", size = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "darkgray") +
+  labs(
+    title = "Krzywa ROC dla modelu scoringowego",
+    subtitle = sprintf("AUC = %.4f, Gini = %.4f", auc_value, gini_value),
+    x = "1 - Swoistość", # Polska nazwa dla 1-Specificity
+    y = "Czułość"        # Polska nazwa dla Sensitivity
+  ) +
+  theme_minimal() +
+  coord_equal() +
+  annotate("text", x = 0.75, y = 0.25, 
+           label = sprintf("AUC = %.4f\nGini = %.4f", auc_value, gini_value), 
+           hjust = 0, size = 4) +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 10),
+    axis.title = element_text(size = 10),
+    panel.grid.minor = element_blank()
+  )
+```
+Analiza progowa
+```{r}
+thresholds <- c(0,100,200,300, 400, 500, 563)
+
+#u nas bad to odrzucenie oferty
+threshold_table <- data.frame(score = thresholds) %>%
+  rowwise() %>%
+  mutate(
+    rzeczywisty_bad = sum(dane_do_modelu_niezbinowane_ze_scoringiem$bad[dane_do_modelu_niezbinowane_ze_scoringiem$score <= score], na.rm = TRUE),
+    przewidywany_bad = sum(dane_do_modelu_niezbinowane_ze_scoringiem$score <= score, na.rm = TRUE)
+
+  ) %>%
+  ungroup()
+
+print(threshold_table)
+
+```
+Funkcja liczaca score
+```{r}
+
+oblicz_score <- function(df) {
+  score <- 310 + 
+    dplyr::case_when(
+      df$grupa_ryzyka < 2 ~ 26,
+      df$grupa_ryzyka < 3 ~ -17,
+      TRUE ~ -29
+    ) +
+    dplyr::case_when(
+      df$kod_partnera < 2 ~ 26,
+      df$kod_partnera < 3 ~ -111,
+      TRUE ~ 3
+    ) +
+    dplyr::case_when(
+      df$koszt_vs_refinansowanie < -0.085 ~ 48,
+      df$koszt_vs_refinansowanie < -0.05 ~ 28,
+      TRUE ~ -11
+    ) +
+    dplyr::case_when(
+      df$kwota_kredytu < 10000 ~ 108,
+      df$kwota_kredytu < 14000 ~ 76,
+      df$kwota_kredytu < 20000 ~ 25,
+      df$kwota_kredytu < 30000 ~ -27,
+      TRUE ~ -94
+    ) +
+    dplyr::case_when(
+      df$oproc_konkur < 0.041 ~ 2,
+      df$oproc_konkur < 0.046 ~ -48,
+      df$oproc_konkur < 0.058 ~ 12,
+      TRUE ~ 39
+    ) +
+    dplyr::case_when(
+      df$oproc_propon < 0.046 ~ 1,
+      df$oproc_propon < 0.062 ~ -7,
+      df$oproc_propon < 0.078 ~ 2,
+      TRUE ~ 6
+    ) +
+    dplyr::case_when(
+      df$oproc_refin < 0.065 ~ 2,
+      df$oproc_refin < 0.1 ~ -5,
+      TRUE ~ -8
+    ) +
+    dplyr::case_when(
+      df$oprocentowanie_rozbieznosc < 0.012 ~ 22,
+      df$oprocentowanie_rozbieznosc < 0.018 ~ -1,
+      TRUE ~ -34
+    ) +
+    dplyr::case_when(
+      df$procent_marzy < 3 ~ 1,
+      df$procent_marzy < 4.2 ~ 2,
+      TRUE ~ -3
+    ) +
+    dplyr::case_when(
+      df$typ_umowy == "N" ~ -10,
+      df$typ_umowy == "R" ~ 7,
+      df$typ_umowy == "U" ~ 1,
+      TRUE ~ 0
+    )
+  
+  return(score)
+}
+
+# sprawdzam zgodnosc z poprzednim scoreboardem
+df$roznica_score <- df$score_ - df$score
+```
+
+```{r}
+#Sprawdzamy czy scoring z funkcji oblicz_score działa tak jak nasz scoring
+#Dodajemy nowa kolumne ze scoringiem z funkcji oblicz_score
+dane_do_modelu_niezbinowane_ze_scoringiem$score_z_funkcji<-oblicz_score(dane_do_modelu_niezbinowane_ze_scoringiem)
+
+#Obliczamy różnice między obydwoma scoringami jako nowa kolumnę
+dane_do_modelu_niezbinowane_ze_scoringiem$roznica_w_scorach<-dane_do_modelu_niezbinowane_ze_scoringiem$score-dane_do_modelu_niezbinowane_ze_scoringiem$score_z_funkcji
+```
+
+```{r}
+#Patrzymy czy wszędzie jest 0 w kolumnie roznica_w_scorach
+View(dane_do_modelu_niezbinowane_ze_scoringiem)
+```
